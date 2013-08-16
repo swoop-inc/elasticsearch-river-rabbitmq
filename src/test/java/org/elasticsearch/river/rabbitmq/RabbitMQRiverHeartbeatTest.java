@@ -29,7 +29,7 @@ import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
 /**
  *
  */
-public class RabbitMQRiverTest extends RabbitMQTestRunner {
+public class RabbitMQRiverHeartbeatTest extends RabbitMQTestRunner {
 
     @Override
     protected void pushMessages(Channel ch) throws IOException {
@@ -44,7 +44,13 @@ public class RabbitMQRiverTest extends RabbitMQTestRunner {
 
     @Override
     protected XContentBuilder river() throws IOException {
-        return jsonBuilder().startObject().field("type", "rabbitmq").endObject();
+        return jsonBuilder()
+                .startObject()
+                    .field("type", "rabbitmq")
+                    .startObject("rabbitmq")
+                        .field("heartbeat", "1s")
+                    .endObject()
+                .endObject();
     }
 
     @Override

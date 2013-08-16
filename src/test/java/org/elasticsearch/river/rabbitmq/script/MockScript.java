@@ -1,14 +1,10 @@
 package org.elasticsearch.river.rabbitmq.script;
 
-import org.elasticsearch.common.jackson.JsonFactory;
+import org.elasticsearch.common.jackson.core.JsonFactory;
 import org.elasticsearch.common.xcontent.json.JsonXContentParser;
 import org.elasticsearch.script.AbstractExecutableScript;
 
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
-import java.io.CharArrayWriter;
-import java.io.IOException;
-import java.io.StringReader;
+import java.io.*;
 import java.util.Map;
 
 public class MockScript extends AbstractExecutableScript {

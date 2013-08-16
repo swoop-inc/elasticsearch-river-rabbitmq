@@ -19,13 +19,7 @@
 
 package org.elasticsearch.river.rabbitmq;
 
-import com.rabbitmq.client.AMQP;
-import com.rabbitmq.client.Address;
-import com.rabbitmq.client.Channel;
-import com.rabbitmq.client.Connection;
-import com.rabbitmq.client.ConnectionFactory;
-import com.rabbitmq.client.QueueingConsumer;
-
+import com.rabbitmq.client.*;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.bulk.BulkRequestBuilder;
 import org.elasticsearch.action.bulk.BulkResponse;
@@ -33,8 +27,12 @@ import org.elasticsearch.client.Client;
 import org.elasticsearch.common.collect.Lists;
 import org.elasticsearch.common.collect.Maps;
 import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.jackson.core.JsonFactory;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
+import org.elasticsearch.common.xcontent.XContentFactory;
+import org.elasticsearch.common.xcontent.XContentType;
+import org.elasticsearch.common.xcontent.json.JsonXContentParser;
 import org.elasticsearch.common.xcontent.support.XContentMapValues;
 import org.elasticsearch.river.AbstractRiverComponent;
 import org.elasticsearch.river.River;
@@ -43,7 +41,7 @@ import org.elasticsearch.river.RiverSettings;
 import org.elasticsearch.script.ExecutableScript;
 import org.elasticsearch.script.ScriptService;
 
-import java.io.IOException;
+import java.io.*;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -61,20 +59,25 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
     private final String rabbitVhost;
 
     private final String rabbitQueue;
+    private final boolean rabbitQueueDeclare;
+    private final boolean rabbitQueueBind;
     private final String rabbitExchange;
     private final String rabbitExchangeType;
     private final String rabbitRoutingKey;
     private final boolean rabbitExchangeDurable;
+    private final boolean rabbitExchangeDeclare;
     private final boolean rabbitQueueDurable;
     private final boolean rabbitQueueAutoDelete;
     private Map rabbitQueueArgs = null; //extra arguments passed to queue for creation (ha settings for example)
+    private final TimeValue rabbitHeartbeat;
 
     private final int bulkSize;
     private final TimeValue bulkTimeout;
     private final boolean ordered;
 
+    private final ExecutableScript bulkScript;
     private final ExecutableScript script;
-    
+
     private volatile boolean closed = false;
 
     private volatile Thread thread;
@@ -109,15 +112,34 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
 
             rabbitQueue = XContentMapValues.nodeStringValue(rabbitSettings.get("queue"), "elasticsearch");
             rabbitExchange = XContentMapValues.nodeStringValue(rabbitSettings.get("exchange"), "elasticsearch");
-            rabbitExchangeType = XContentMapValues.nodeStringValue(rabbitSettings.get("exchange_type"), "direct");
             rabbitRoutingKey = XContentMapValues.nodeStringValue(rabbitSettings.get("routing_key"), "elasticsearch");
-            rabbitExchangeDurable = XContentMapValues.nodeBooleanValue(rabbitSettings.get("exchange_durable"), true);
-            rabbitQueueDurable = XContentMapValues.nodeBooleanValue(rabbitSettings.get("queue_durable"), true);
-            rabbitQueueAutoDelete = XContentMapValues.nodeBooleanValue(rabbitSettings.get("queue_auto_delete"), false);
 
-            if (rabbitSettings.containsKey("args")) {
-                rabbitQueueArgs = (Map<String, Object>) rabbitSettings.get("args");
+            rabbitExchangeDeclare = XContentMapValues.nodeBooleanValue(rabbitSettings.get("exchange_declare"), true);
+            if (rabbitExchangeDeclare) {
+                
+                rabbitExchangeType = XContentMapValues.nodeStringValue(rabbitSettings.get("exchange_type"), "direct");
+                rabbitExchangeDurable = XContentMapValues.nodeBooleanValue(rabbitSettings.get("exchange_durable"), true);
+            } else {
+                rabbitExchangeType = "direct";
+                rabbitExchangeDurable = true;
             }
+
+            rabbitQueueDeclare = XContentMapValues.nodeBooleanValue(rabbitSettings.get("queue_declare"), true);
+            if (rabbitQueueDeclare) {
+                rabbitQueueDurable = XContentMapValues.nodeBooleanValue(rabbitSettings.get("queue_durable"), true);
+                rabbitQueueAutoDelete = XContentMapValues.nodeBooleanValue(rabbitSettings.get("queue_auto_delete"), false);
+                if (rabbitSettings.containsKey("args")) {
+                    rabbitQueueArgs = (Map<String, Object>) rabbitSettings.get("args");
+                }
+            } else {
+                rabbitQueueDurable = true;
+                rabbitQueueAutoDelete = false;
+            }
+            rabbitQueueBind = XContentMapValues.nodeBooleanValue(rabbitSettings.get("queue_bind"), true);
+
+            rabbitHeartbeat = TimeValue.parseTimeValue(XContentMapValues.nodeStringValue(
+                    rabbitSettings.get("heartbeat"), "30m"), TimeValue.timeValueMinutes(30));
+
         } else {
             rabbitAddresses = new Address[]{ new Address("localhost", AMQP.PROTOCOL.PORT) };
             rabbitUser = "guest";
@@ -131,6 +153,12 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
             rabbitExchangeType = "direct";
             rabbitExchangeDurable = true;
             rabbitRoutingKey = "elasticsearch";
+
+            rabbitExchangeDeclare = true;
+            rabbitQueueDeclare = true;
+            rabbitQueueBind = true;
+
+            rabbitHeartbeat = TimeValue.timeValueMinutes(30);
         }
 
         if (settings.settings().containsKey("index")) {
@@ -148,6 +176,27 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
             ordered = false;
         }
         
+        if (settings.settings().containsKey("bulk_script_filter")) {
+            Map<String, Object> scriptSettings = (Map<String, Object>) settings.settings().get("bulk_script_filter");
+            if (scriptSettings.containsKey("script")) {
+                String scriptLang = "native";
+                if(scriptSettings.containsKey("script_lang")) {
+                    scriptLang = scriptSettings.get("script_lang").toString();
+                }
+                Map<String, Object> scriptParams = null;
+                if (scriptSettings.containsKey("script_params")) {
+                    scriptParams = (Map<String, Object>) scriptSettings.get("script_params");
+                } else {
+                    scriptParams = Maps.newHashMap();
+                }
+                bulkScript = scriptService.executable(scriptLang, scriptSettings.get("script").toString(), scriptParams);
+            } else {
+                bulkScript = null;
+            }
+        } else {
+          bulkScript = null;
+        }
+
         if (settings.settings().containsKey("script_filter")) {
             Map<String, Object> scriptSettings = (Map<String, Object>) settings.settings().get("script_filter");
             if (scriptSettings.containsKey("script")) {
@@ -166,8 +215,9 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                 script = null;
             }
         } else {
-          script = null;
+            script = null;
         }
+
     }
 
     @Override
@@ -176,6 +226,7 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
         connectionFactory.setUsername(rabbitUser);
         connectionFactory.setPassword(rabbitPassword);
         connectionFactory.setVirtualHost(rabbitVhost);
+        connectionFactory.setRequestedHeartbeat(new Long(rabbitHeartbeat.getSeconds()).intValue());
 
         logger.info("creating rabbitmq river, addresses [{}], user [{}], vhost [{}]", rabbitAddresses, connectionFactory.getUsername(), connectionFactory.getVirtualHost());
 
@@ -225,9 +276,18 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                 QueueingConsumer consumer = new QueueingConsumer(channel);
                 // define the queue
                 try {
-                    channel.exchangeDeclare(rabbitExchange/*exchange*/, rabbitExchangeType/*type*/, rabbitExchangeDurable);
-                    channel.queueDeclare(rabbitQueue/*queue*/, rabbitQueueDurable/*durable*/, false/*exclusive*/, rabbitQueueAutoDelete/*autoDelete*/, rabbitQueueArgs/*extra args*/);
-                    channel.queueBind(rabbitQueue/*queue*/, rabbitExchange/*exchange*/, rabbitRoutingKey/*routingKey*/);
+                    if (rabbitQueueDeclare) {
+                        // only declare the queue if we should
+                        channel.queueDeclare(rabbitQueue/*queue*/, rabbitQueueDurable/*durable*/, false/*exclusive*/, rabbitQueueAutoDelete/*autoDelete*/, rabbitQueueArgs/*extra args*/);
+                    }
+                    if (rabbitExchangeDeclare) {
+                        // only declare the exchange if we should
+                        channel.exchangeDeclare(rabbitExchange/*exchange*/, rabbitExchangeType/*type*/, rabbitExchangeDurable);
+                    }
+                    if (rabbitQueueBind) {
+                        // only bind queue if we should
+                        channel.queueBind(rabbitQueue/*queue*/, rabbitExchange/*exchange*/, rabbitRoutingKey/*routingKey*/);
+                    }
                     channel.basicConsume(rabbitQueue/*queue*/, false/*noAck*/, consumer);
                 } catch (Exception e) {
                     if (!closed) {
@@ -279,7 +339,7 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                                     try {
                                         processBody(task.getBody(), bulkRequestBuilder);
                                         deliveryTags.add(task.getEnvelope().getDeliveryTag());
-                                    } catch (Exception e) {
+                                    } catch (Throwable e) {
                                         logger.warn("failed to parse request for delivery tag [{}], ack'ing...", e, task.getEnvelope().getDeliveryTag());
                                         try {
                                             channel.basicAck(task.getEnvelope().getDeliveryTag(), false);
@@ -295,6 +355,14 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                                 if (closed) {
                                     break;
                                 }
+                            } catch (ShutdownSignalException sse) {
+                                logger.warn("Received a shutdown signal! initiatedByApplication: [{}], hard error: [{}]", sse,
+                                        sse.isInitiatedByApplication(), sse.isHardError());
+                                if (!closed && sse.isInitiatedByApplication()) {
+                                    logger.error("failed to get next message, reconnecting...", sse);
+                                }
+                                cleanup(0, "failed to get message");
+                                break;
                             }
                         }
 
@@ -364,19 +432,67 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                 logger.debug("failed to close connection on [{}]", e, message);
             }
         }
-        
+
         private void processBody(byte[] body, BulkRequestBuilder bulkRequestBuilder) throws Exception {
             if (body == null) return;
-            
-            if (script == null) {
-                bulkRequestBuilder.add(body, 0, body.length, false);
-            } else {
+
+            // first, the "full bulk" script
+            if (bulkScript != null) {
                 String bodyStr = new String(body);
-                script.setNextVar("body", bodyStr);
-                String newBodyStr = (String) script.run();
-                if (newBodyStr != null) {
-                    byte[] newBody = newBodyStr.getBytes();
-                    bulkRequestBuilder.add(newBody, 0, newBody.length, false);
+                bulkScript.setNextVar("body", bodyStr);
+                String newBodyStr = (String) bulkScript.run();
+                if (newBodyStr == null) return ;
+                body =  newBodyStr.getBytes();
+            }
+
+            // second, the "doc per doc" script
+            if (script != null) {
+                processBodyPerLine(body, bulkRequestBuilder);
+            } else {
+                bulkRequestBuilder.add(body, 0, body.length, false);
+            }
+        }
+
+        private void processBodyPerLine(byte[] body, BulkRequestBuilder bulkRequestBuilder) throws Exception {
+            BufferedReader reader = new BufferedReader(new StringReader(new String(body)));
+
+            JsonFactory factory = new JsonFactory();
+            for (String line = reader.readLine(); line != null; line = reader.readLine()) {
+                JsonXContentParser parser = new JsonXContentParser(factory.createJsonParser(line));
+                Map<String, Object> asMap = parser.map();
+
+                if (asMap.get("delete") != null) {
+                    // We don't touch deleteRequests
+                    String newContent = line + "\n";
+                    bulkRequestBuilder.add(newContent.getBytes(), 0, newContent.getBytes().length, false);
+                } else {
+                    // But we send other requests to the script Engine in ctx field
+                    Map<String, Object> ctx;
+                    String payload = null;
+                    try {
+                        payload = reader.readLine();
+                        ctx = XContentFactory.xContent(XContentType.JSON).createParser(payload).mapAndClose();
+                    } catch (IOException e) {
+                        logger.warn("failed to parse {}", e, payload);
+                        continue;
+                    }
+                    script.setNextVar("ctx", ctx);
+                    script.run();
+                    ctx = (Map<String, Object>) script.unwrap(ctx);
+                    if (ctx != null) {
+                        // Adding header
+                        StringBuffer request = new StringBuffer(line);
+                        request.append("\n");
+                        // Adding new payload
+                        request.append(XContentFactory.jsonBuilder().map(ctx).string());
+                        request.append("\n");
+
+                        if (logger.isTraceEnabled()) {
+                            logger.trace("new bulk request is now: {}", request.toString());
+                        }
+                        byte[] binRequest = request.toString().getBytes();
+                        bulkRequestBuilder.add(binRequest, 0, binRequest.length, false);
+                    }
                 }
             }
         }
